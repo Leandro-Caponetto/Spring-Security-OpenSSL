@@ -1,6 +1,5 @@
 package com.spring.security.services.impl;
 
-
 import com.nimbusds.jose.*;
 import com.nimbusds.jose.crypto.RSASSASigner;
 import com.nimbusds.jose.crypto.RSASSAVerifier;
@@ -11,17 +10,17 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.interfaces.RSAPublicKey;
-import java.security.spec.InvalidKeySpecException;
-import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.*;
 import java.text.ParseException;
 import java.util.Base64;
 import java.util.Date;
@@ -46,14 +45,13 @@ public class JWTUtilityServiceImpl implements IJWTUtilityService {
         JWTClaimsSet claimsSet = new JWTClaimsSet.Builder()
                 .subject(String.valueOf(userId))
                 .issueTime(now)
-                .expirationTime(new Date(now.getTime() + 1400000)) // 1 hour expiration
+                .expirationTime(new Date(now.getTime() + 1400000)) // 1,400,000 ms ~ 23.3 min; ajustá si querés 1h = 3_600_000
                 .build();
         SignedJWT signedJWT = new SignedJWT(new JWSHeader(JWSAlgorithm.RS256), claimsSet);
         signedJWT.sign(signer);
 
         return signedJWT.serialize();
     }
-
 
     @Override
     public JWTClaimsSet parseJWT(String jwt) throws IOException, NoSuchAlgorithmException, InvalidKeySpecException, JOSEException, ParseException {
@@ -74,29 +72,113 @@ public class JWTUtilityServiceImpl implements IJWTUtilityService {
         return claimsSet;
     }
 
-
-
     private PrivateKey loadPrivateKey(Resource resource) throws IOException, NoSuchAlgorithmException, InvalidKeySpecException {
-
-        byte[] keyBytes = Files.readAllBytes(Paths.get(resource.getURI()));
-        String privateKeyPEM = new String(keyBytes, StandardCharsets.UTF_8)
+        byte[] keyBytes = readAllBytes(resource);
+        String pem = new String(keyBytes, StandardCharsets.UTF_8)
                 .replace("-----BEGIN PRIVATE KEY-----", "")
                 .replace("-----END PRIVATE KEY-----", "")
                 .replaceAll("\\s", "");
-        byte[] decodedkey = Base64.getDecoder().decode(privateKeyPEM);
+        byte[] decoded = Base64.getDecoder().decode(pem);
         KeyFactory keyFactory = KeyFactory.getInstance("RSA");
-        return keyFactory.generatePrivate(new PKCS8EncodedKeySpec(decodedkey));
+        PKCS8EncodedKeySpec keySpec = new PKCS8EncodedKeySpec(decoded);
+        return keyFactory.generatePrivate(keySpec);
     }
 
     private PublicKey loadPublicKey(Resource resource) throws IOException, NoSuchAlgorithmException, InvalidKeySpecException {
+        byte[] keyBytes = readAllBytes(resource);
+        String pem = new String(keyBytes, StandardCharsets.UTF_8).trim();
 
-        byte[] keyBytes = Files.readAllBytes(Paths.get(resource.getURI()));
-        String publicKeyPEM = new String(keyBytes, StandardCharsets.UTF_8)
-                .replace("-----BEGIN PUBLIC KEY-----", "")
-                .replace("-----END PUBLIC KEY-----", "")
-                .replaceAll("\\s", "");
-        byte[] decodedkey = Base64.getDecoder().decode(publicKeyPEM);
-        KeyFactory keyFactory = KeyFactory.getInstance("RSA");
-        return keyFactory.generatePublic(new PKCS8EncodedKeySpec(decodedkey));
+        // Caso normal: BEGIN PUBLIC KEY -> X.509 SubjectPublicKeyInfo
+        if (pem.contains("-----BEGIN PUBLIC KEY-----")) {
+            String publicKeyPEM = pem
+                    .replace("-----BEGIN PUBLIC KEY-----", "")
+                    .replace("-----END PUBLIC KEY-----", "")
+                    .replaceAll("\\s", "");
+            byte[] decoded = Base64.getDecoder().decode(publicKeyPEM);
+            KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+            X509EncodedKeySpec keySpec = new X509EncodedKeySpec(decoded);
+            return keyFactory.generatePublic(keySpec);
+        }
+
+        // Fallback: si la clave viene como PKCS#1 -> "-----BEGIN RSA PUBLIC KEY-----"
+        if (pem.contains("-----BEGIN RSA PUBLIC KEY-----")) {
+            String publicKeyPEM = pem
+                    .replace("-----BEGIN RSA PUBLIC KEY-----", "")
+                    .replace("-----END RSA PUBLIC KEY-----", "")
+                    .replaceAll("\\s", "");
+            byte[] decoded = Base64.getDecoder().decode(publicKeyPEM);
+            return generatePublicKeyFromPKCS1(decoded);
+        }
+
+        // Si no tiene headers, intentamos tratar el blob como X.509
+        try {
+            byte[] decoded = Base64.getDecoder().decode(pem.replaceAll("\\s", ""));
+            KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+            X509EncodedKeySpec keySpec = new X509EncodedKeySpec(decoded);
+            return keyFactory.generatePublic(keySpec);
+        } catch (IllegalArgumentException | InvalidKeySpecException e) {
+            throw new InvalidKeySpecException("Formato de clave pública no soportado. Usá X.509 (BEGIN PUBLIC KEY) o RSA PKCS#1 (BEGIN RSA PUBLIC KEY).", e);
+        }
+    }
+
+    // Lee todo el Resource de forma segura (funciona dentro de JAR)
+    private byte[] readAllBytes(Resource resource) throws IOException {
+        try (InputStream is = resource.getInputStream()) {
+            return is.readAllBytes();
+        }
+    }
+
+    // Convierte PKCS#1 (ASN.1: SEQUENCE { modulus, exponent }) a PublicKey
+    private PublicKey generatePublicKeyFromPKCS1(byte[] pkcs1Bytes) throws NoSuchAlgorithmException, InvalidKeySpecException {
+        try {
+            // Parsear la estructura ASN.1 mínima para extraer dos INTEGER (modulus y exponent).
+            ByteArrayInputStream in = new ByteArrayInputStream(pkcs1Bytes);
+            int seq = in.read();
+            if (seq != 0x30) { // SEQUENCE
+                throw new InvalidKeySpecException("Formato PKCS#1 inválido, no comienza con SEQUENCE (0x30).");
+            }
+            int seqLen = readLength(in);
+
+            // First INTEGER (modulus)
+            int tag = in.read();
+            if (tag != 0x02) throw new InvalidKeySpecException("Formato PKCS#1 inválido (no INTEGER para modulus).");
+            int modLen = readLength(in);
+            byte[] modBytes = new byte[modLen];
+            if (in.read(modBytes) != modLen) throw new InvalidKeySpecException("Error leyendo modulus.");
+
+            // Second INTEGER (exponent)
+            tag = in.read();
+            if (tag != 0x02) throw new InvalidKeySpecException("Formato PKCS#1 inválido (no INTEGER para exponent).");
+            int expLen = readLength(in);
+            byte[] expBytes = new byte[expLen];
+            if (in.read(expBytes) != expLen) throw new InvalidKeySpecException("Error leyendo exponent.");
+
+            BigInteger modulus = new BigInteger(1, modBytes);
+            BigInteger exponent = new BigInteger(1, expBytes);
+
+            RSAPublicKeySpec spec = new RSAPublicKeySpec(modulus, exponent);
+            KeyFactory kf = KeyFactory.getInstance("RSA");
+            return kf.generatePublic(spec);
+        } catch (IOException ex) {
+            throw new InvalidKeySpecException("Error parseando PKCS#1", ex);
+        }
+    }
+
+    // Lee longitud ASN.1 (short/long forms)
+    private int readLength(ByteArrayInputStream in) throws IOException, InvalidKeySpecException {
+        int length = in.read();
+        if (length < 0) throw new IOException("Unexpected EOF while reading length");
+        if ((length & 0x80) == 0) {
+            return length;
+        }
+        int numBytes = length & 0x7F;
+        if (numBytes > 4) throw new InvalidKeySpecException("Longitud ASN.1 demasiado grande");
+        int val = 0;
+        for (int i = 0; i < numBytes; i++) {
+            int next = in.read();
+            if (next < 0) throw new IOException("Unexpected EOF while reading length bytes");
+            val = (val << 8) + next;
+        }
+        return val;
     }
 }

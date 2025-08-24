@@ -59,29 +59,30 @@ public class AuthServiceImpl implements IAuthService {
     public ResponseDTO register(UserEntity user) throws Exception {
         try {
             ResponseDTO response = userValidations.validate(user);
-            List<UserEntity> getAllUsers = userRepository.findAll();
 
-            if (response.getNumOfErrors() > 0){
+            if (response.getNumOfErrors() > 0) {
                 return response;
             }
 
-            for (UserEntity repeatFields : getAllUsers) {
-                if (repeatFields != null) {
-                    response.setNumOfErrors(response.getNumOfErrors() + 1);
-                    response.setMessage("User already exists!");
-                    return response;
-                }
+            // Verificar si ya existe por email
+            if (userRepository.existsByEmail(user.getEmail())) {
+                response.setNumOfErrors(1);
+                response.setMessage("El correo ya está registrado.");
+                return response;
             }
 
+            // Encriptar la contraseña antes de guardar
             BCryptPasswordEncoder encoder = new BCryptPasswordEncoder(12);
             user.setPassword(encoder.encode(user.getPassword()));
             userRepository.save(user);
-            response.setMessage("User created successfully!");
+
+            response.setMessage("Usuario creado con éxito!");
             return response;
         } catch (Exception e) {
             throw new Exception(e.getMessage());
         }
     }
+
 
     private boolean verifyPassword(String enteredPassword, String storedPassword) {
         BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
